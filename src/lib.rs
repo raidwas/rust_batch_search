@@ -366,10 +366,10 @@ mod tests {
         group.sample_size(20);
         group.warm_up_time(core::time::Duration::from_millis(1000));
         group.measurement_time(core::time::Duration::from_secs(10));
-        group.plot_config(PlotConfiguration::default().summary_scale(AxisScale::Logarithmic));
+        //group.plot_config(PlotConfiguration::default().summary_scale(AxisScale::Logarithmic));
         for step in 1..exp_steps + 1 {
             let size = 1 << (exp_stepsize * step);
-            let parameter_string = format!("{}", size);
+            let parameter_string = format!("{}", step);
             group.bench_with_input(
                 BenchmarkId::new("default", &parameter_string),
                 &size,
