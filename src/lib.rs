@@ -308,11 +308,9 @@ pub mod concurrent{
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    use test::Bencher;
     use rand_core::{SeedableRng, RngCore};
     use rand_pcg::Pcg64Mcg;
-    use criterion::{BenchmarkId, Criterion};
+    use criterion::{BenchmarkId, Criterion, PlotConfiguration, AxisScale};
 
     #[test]
     fn it_works() {
@@ -352,23 +350,25 @@ mod tests {
         }
     }
 
-    const N: usize = 1<<28; //22 -> 16Mbyte when using u32
-    const M: usize = 1<<10;
-
     fn bench(c: &mut Criterion) {
-        let (slice, values) = create_data_u32(N,M);
-        let mut results = Vec::with_capacity(M);
-        for _ in 0..M {
+        let exp_stepsize = 4;
+        let exp_steps = 8;
+        let max_exp = exp_stepsize * exp_steps;
+        let searches = 1<<10;
+
+        let (slice, values) = create_data_u32(1<<max_exp,searches);
+        let mut results = Vec::with_capacity(searches);
+        for _ in 0..searches {
             results.push(Ok(0));
         }
+
         let mut group = c.benchmark_group("batch_search");
-        group.sample_size(10);
-        group.warm_up_time(core::time::Duration::from_millis(500));
-        group.measurement_time(core::time::Duration::from_secs(3));
-        let steps = 8;
-        let stepsize = N / steps;
-        for step in 1..steps + 1 {
-            let size = step * stepsize;
+        group.sample_size(20);
+        group.warm_up_time(core::time::Duration::from_millis(1000));
+        group.measurement_time(core::time::Duration::from_secs(10));
+        group.plot_config(PlotConfiguration::default().summary_scale(AxisScale::Logarithmic));
+        for step in 1..exp_steps + 1 {
+            let size = 1 << (exp_stepsize * step);
             let parameter_string = format!("{}", size);
             group.bench_with_input(
                 BenchmarkId::new("default", &parameter_string),
