@@ -7,16 +7,18 @@ For this I especially wanted to take an existing search implementation (the one 
 The result shows that its possible to transform the non concurrent search into a concurrent one, performing much better on big input sizes, by only adding around 2 lines of code (excluding some code to keep track of the concurrent searches).
 
 
-These are just some simple benchmarks that compare non concurrent (`default`, and `naive`) with concurrent (`handcrafted`, `generator`, and `concurrent`).
+These are just some simple benchmarks that compare non concurrent (`default`, and `naive`) with concurrent searches.
  - `default`, and `naive` should compile to basically the same code as `default is just a call to the `std::slice::binary_search` and `naive` is just that code.
  - `handcrafted` implements a handcrafted state machine and is just there to show how much effort it is compared to the `generator` version.
  - `generator` uses generators (yield and resume) to implement the state machine and is the most elegant solution.
  Compared to the `default` implementation the core search function has only 2 additional lines of code (`prefetch`, and `yield`), excluding the additional code to keep track of the concurrent searches.
  - `concurrent` uses a poc Future in order to yield, but has quite some overhead due to the interface Futures have to provide.
+ - `generator_optimized` also uses generators and changes the search a bit so that the state machine becomes smaller (fewer variables on the yield point). This improves the state size from 88 bytes to 48 bytes.
  
 The benchmark results (the number behind the version says how many concurrent searches are performed at a time):
 [benchmark results](lines.svg)
-
+Comparison between `generator` and `generator_optimized` using 8 concurrent searches each:
+[benchmark results](lines_generator.svg)
 
 As you see in the beginning the non concurrent versions perform better. I assume this is because of the following reasons:
  - the slice fits completly into the cache and the execution is only limited by cpu speed
