@@ -13,7 +13,7 @@ These are just some simple benchmarks that compare non concurrent (`default`, an
  - `generator` uses generators (yield and resume) to implement the state machine and is the most elegant solution.
  Compared to the `default` implementation the core search function has only 2 additional lines of code (`prefetch`, and `yield`), excluding the additional code to keep track of the concurrent searches.
  - `concurrent` uses a poc Future in order to yield, but has quite some overhead due to the interface Futures have to provide.
- - `generator_optimized` also uses generators and changes the search a bit so that the state machine becomes smaller (fewer variables on the yield point). This improves the state size from 88 bytes to 48 bytes.
+ - `generator_optimized` also uses generators and changes the search a bit so that the state machine becomes smaller (fewer variables on the yield point). This improves the state size from 88 bytes to 48 bytes. Currently I don't know how to properly inspect the state machine the compiler produces, but my guess for the size requirements would be: 16 byte for the slice + 8 bytes for the offset + 8 bytes to remember which input this search is for + Option to represent an unused generator slot in the array + State of the generator + padding. So the option, state of the generator and padding use 16 bytes together.
  
 The benchmark results (the number behind the version says how many concurrent searches are performed at a time):
 [benchmark results](lines.svg)
