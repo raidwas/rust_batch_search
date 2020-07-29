@@ -31,6 +31,22 @@ where
     x
 }
 
+/// prefetches data into the cache, as local as possible
+#[inline(always)]
+fn prefetch_read_data<T>(data: *const T) {
+    // this is sound, since we only ask the cpu to pull data into the cache.
+    // as far as I know this is also only marked unsafe because its a extern function.
+    unsafe {
+        core::intrinsics::prefetch_read_data(data, 3);
+    }
+}
+
+#[allow(unused)]
+fn size_of<T>(_x: &T) -> usize {
+    core::mem::size_of::<T>()
+}
+
+//using std::slice::binary_search
 pub mod default {
     pub fn batch_search<T: Ord>(slice: &[T], values: &[T], results: &mut [Result<usize, usize>]) {
         assert!(results.len() == values.len());
@@ -39,29 +55,38 @@ pub mod default {
         }
     }
 }
-pub mod naive {
-    use core::cmp::Ordering;
 
+//the binary search implementation as found in the std, adapted to fit the parameters
+pub mod naive {
+    use core::cmp::Ordering::{Equal, Greater, Less};
     fn binary_search<T: Ord>(slice: &[T], val: &T) -> Result<usize, usize> {
-        let mut offset = 0;
-        let mut elements = slice.len();
-        while elements != 0 {
-            let elements_left_of_cmp = elements / 2;
-            let index = offset + elements_left_of_cmp;
-            let other = unsafe { slice.get_unchecked(index) };
-            match val.cmp(other) {
-                Ordering::Less => {
-                    elements = elements_left_of_cmp;
-                }
-                Ordering::Equal => return Ok(index),
-                Ordering::Greater => {
-                    offset = index + 1;
-                    elements -= elements_left_of_cmp + 1;
-                }
-            }
+        let s = slice;
+        let mut size = s.len();
+        if size == 0 {
+            return Err(0);
         }
-        Err(offset)
+        let mut base = 0usize;
+        while size > 1 {
+            let half = size / 2;
+            let mid = base + half;
+            // mid is always in [0, size), that means mid is >= 0 and < size.
+            // mid >= 0: by definition
+            // mid < size: mid = size / 2 + size / 4 + size / 8 ...
+
+            // this would also be the place to prefetch s[mid]
+            let cmp = unsafe { s.get_unchecked(mid) }.cmp(val);
+            base = if cmp == Greater { base } else { mid };
+            size -= half;
+        }
+        // base is always in [0, size) because base <= mid.
+        let cmp = unsafe { s.get_unchecked(base) }.cmp(val);
+        if cmp == Equal {
+            Ok(base)
+        } else {
+            Err(base + (cmp == Less) as usize)
+        }
     }
+
     pub fn batch_search<T: Ord>(slice: &[T], values: &[T], results: &mut [Result<usize, usize>]) {
         assert!(results.len() == values.len());
         for i in 0..values.len() {
@@ -69,14 +94,14 @@ pub mod naive {
         }
     }
 }
+
+//handcrafted version that searches concurrently
 pub mod handcrafted {
-    use super::array;
+    use super::{array, prefetch_read_data};
     use core::cmp::Ordering;
-    use core::intrinsics::prefetch_read_data;
 
     struct State<'a, T> {
         offset: usize,
-        elements: usize,
         slice: &'a [T],
         val: &'a T,
     }
@@ -84,7 +109,6 @@ pub mod handcrafted {
         fn new(slice: &'a [T], val: &'a T) -> Self {
             let state = State {
                 offset: 0,
-                elements: slice.len(),
                 slice: slice,
                 val: val,
             };
@@ -92,34 +116,28 @@ pub mod handcrafted {
             state
         }
         fn prefetch(&self) {
-            let index = self.index();
-            unsafe { prefetch_read_data(self.slice.as_ptr().add(index), 3) };
-        }
-        fn elements_left_of_cmp(&self) -> usize {
-            self.elements / 2
-        }
-        fn index(&self) -> usize {
-            self.offset + self.elements_left_of_cmp()
+            let index = self.slice.len() / 2;
+            prefetch_read_data(unsafe { self.slice.get_unchecked(index) });
         }
         fn search(&mut self) -> Option<Result<usize, usize>> {
-            let index = self.index();
+            let index = self.slice.len() / 2;
             //this hopefully got prefetched
             let other = unsafe { self.slice.get_unchecked(index) };
             match self.val.cmp(other) {
                 Ordering::Less => {
-                    self.elements = self.elements_left_of_cmp();
+                    self.slice = unsafe { self.slice.get_unchecked(..index) };
                 }
-                Ordering::Equal => return Some(Ok(index)),
+                Ordering::Equal => return Some(Ok(self.offset + index)),
                 Ordering::Greater => {
-                    self.offset = index + 1;
-                    self.elements -= self.elements_left_of_cmp() + 1;
+                    self.offset += index + 1;
+                    self.slice = unsafe { self.slice.get_unchecked(index + 1..) };
                 }
             };
-            if self.elements != 0 {
+            if self.slice.len() != 0 {
                 self.prefetch();
                 None
             } else {
-                Some(Err(self.index()))
+                Some(Err(self.offset))
             }
         }
     }
@@ -132,6 +150,9 @@ pub mod handcrafted {
         assert!(results.len() == values.len());
 
         let mut states: [_; B] = array(|i| Some((i, State::new(slice, &values[i]))));
+
+        //println!("handcrafted state size: {}", super::size_of(&states[0]));
+
         let mut next = B;
         let mut breaks = 0;
         loop {
@@ -166,12 +187,13 @@ pub mod handcrafted {
         }
     }
 }
+
+//version that uses Futures in order to accomplish concurrency
 pub mod concurrent {
     use {
-        super::array,
-        core::intrinsics::prefetch_read_data,
+        super::{array, prefetch_read_data},
         core::{
-            cmp::Ordering,
+            cmp::Ordering::{Equal, Greater, Less},
             future::Future,
             pin::Pin,
             task::{Context, Poll, RawWaker, RawWakerVTable, Waker},
@@ -200,26 +222,34 @@ pub mod concurrent {
     }
 
     async fn binary_search<T: Ord>(slice: &[T], val: &T) -> Result<usize, usize> {
-        let mut offset = 0;
-        let mut elements = slice.len();
-        while elements != 0 {
-            let elements_left_of_cmp = elements / 2;
-            let index = offset + elements_left_of_cmp;
-            unsafe { prefetch_read_data(slice.as_ptr().add(index), 3) };
-            YieldFuture::new().await;
-            let other = unsafe { slice.get_unchecked(index) };
-            match val.cmp(other) {
-                Ordering::Less => {
-                    elements = elements_left_of_cmp;
-                }
-                Ordering::Equal => return Ok(index),
-                Ordering::Greater => {
-                    offset = index + 1;
-                    elements -= elements_left_of_cmp + 1;
-                }
-            }
+        let s = slice;
+        let mut size = s.len();
+        if size == 0 {
+            return Err(0);
         }
-        Err(offset)
+        let mut base = 0usize;
+        while size > 1 {
+            let half = size / 2;
+            let mid = base + half;
+            // mid is always in [0, size), that means mid is >= 0 and < size.
+            // mid >= 0: by definition
+            // mid < size: mid = size / 2 + size / 4 + size / 8 ...
+
+            // this would also be the place to prefetch s[mid]
+            prefetch_read_data(unsafe { s.get_unchecked(mid) });
+            YieldFuture::new().await;
+
+            let cmp = unsafe { s.get_unchecked(mid) }.cmp(val);
+            base = if cmp == Greater { base } else { mid };
+            size -= half;
+        }
+        // base is always in [0, size) because base <= mid.
+        let cmp = unsafe { s.get_unchecked(base) }.cmp(val);
+        if cmp == Equal {
+            Ok(base)
+        } else {
+            Err(base + (cmp == Less) as usize)
+        }
     }
 
     #[allow(non_upper_case_globals)]
@@ -249,6 +279,8 @@ pub mod concurrent {
         let mut context = Context::from_waker(&waker);
 
         let mut futures: [_; B] = array(|i| Some((i, binary_search(slice, &values[i]))));
+        //println!("Future state size: {}", super::size_of(&futures[0]));
+
         let mut next = B;
         let mut breaks = 0;
         loop {
@@ -262,9 +294,7 @@ pub mod concurrent {
                 //safe, since we never move the future out of the futures array
                 let pinned = unsafe { Pin::new_unchecked(future) };
                 match Future::poll(pinned, &mut context) {
-                    Poll::Pending => {
-                        //println!("Pending {}", j);
-                    }
+                    Poll::Pending => {}
                     Poll::Ready(result) => {
                         results[*j] = result;
                         if next == values.len() {
@@ -284,12 +314,16 @@ pub mod concurrent {
         }
     }
 }
+
+//version that uses generators in order to achieve concurrency
 pub mod generator {
     use {
-        super::array,
-        core::intrinsics::prefetch_read_data,
+        super::{array, prefetch_read_data},
         core::ops::{Generator, GeneratorState},
-        core::{cmp::Ordering, pin::Pin},
+        core::{
+            cmp::Ordering::{Equal, Greater, Less},
+            pin::Pin,
+        },
     };
 
     pub fn batch_search<T: Ord, const B: usize>(
@@ -302,42 +336,50 @@ pub mod generator {
         let get_generator = |i: usize| {
             let val: &T = &values[i];
             move || {
-                let mut offset = 0;
-                let mut elements = slice.len();
-                while elements != 0 {
-                    unsafe { prefetch_read_data(slice.as_ptr().add(offset + elements / 2), 3) };
-                    yield;
-                    let other = unsafe { slice.get_unchecked(offset + elements / 2) };
-                    match val.cmp(other) {
-                        Ordering::Less => {
-                            elements = elements / 2;
-                        }
-                        Ordering::Equal => return Ok(index),
-                        Ordering::Greater => {
-                            offset += elements / 2;
-                            elements -= elements / 2 + 1;
-                        }
-                    }
+                let s = slice;
+                let mut size = s.len();
+                if size == 0 {
+                    return Err(0);
                 }
-                Err(offset)
+                let mut base = 0usize;
+                while size > 1 {
+                    let half = size / 2;
+                    let mid = base + half;
+                    // mid is always in [0, size), that means mid is >= 0 and < size.
+                    // mid >= 0: by definition
+                    // mid < size: mid = size / 2 + size / 4 + size / 8 ...
+
+                    // this would also be the place to prefetch s[mid]
+                    prefetch_read_data(unsafe { s.get_unchecked(mid) });
+                    yield;
+
+                    let cmp = unsafe { s.get_unchecked(mid) }.cmp(val);
+                    base = if cmp == Greater { base } else { mid };
+                    size -= half;
+                }
+                // base is always in [0, size) because base <= mid.
+                let cmp = unsafe { s.get_unchecked(base) }.cmp(val);
+                if cmp == Equal {
+                    Ok(base)
+                } else {
+                    Err(base + (cmp == Less) as usize)
+                }
             }
         };
 
         let mut generators: [_; B] = array(|i| Some((i, get_generator(i))));
+        //println!("generator state size: {}", super::size_of(&generators[0]));
         let mut next = B;
         let mut breaks = 0;
         loop {
             for i in 0..B {
-                //println!("i: {}", i);
                 let current = &mut generators[i];
                 if current.is_none() {
                     continue;
                 }
                 let (j, generator) = current.as_mut().unwrap();
-                match Pin::new(generator).resume() {
-                    GeneratorState::Yielded(()) => {
-                        //println!("Pending {}", j);
-                    }
+                match Pin::new(generator).resume(()) {
+                    GeneratorState::Yielded(()) => {}
                     GeneratorState::Complete(result) => {
                         results[*j] = result;
                         if next == values.len() {
@@ -361,7 +403,7 @@ pub mod generator {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use criterion::{AxisScale, BenchmarkId, Criterion, PlotConfiguration};
+    use criterion::{BenchmarkId, Criterion};
     use rand_core::{RngCore, SeedableRng};
     use rand_pcg::Pcg64Mcg;
 
@@ -391,8 +433,8 @@ mod tests {
 
     #[test]
     fn test_searches() {
-        let n = 1 << 10;
-        let m = 1 << 9;
+        let n = 1 << 8;
+        let m = 1 << 4;
         let (slice, values) = create_data_u32(n, m);
         let functions: [fn(&[u32], &[u32], &mut [Result<usize, usize>]); 5] = [
             default::batch_search,
@@ -416,6 +458,7 @@ mod tests {
             functions[i](&slice, &values, &mut results[i]);
         }
         for i in 1..results.len() {
+            println!("{}", i);
             assert_eq!(results[0], results[i]);
         }
     }
@@ -423,14 +466,13 @@ mod tests {
     fn bench(c: &mut Criterion) {
         let exp_offset = 4;
         let exp_stepsize = 1;
-        let exp_steps = (32 - exp_offset) / exp_stepsize;
-        let max_exp = exp_offset + exp_stepsize * exp_steps;
+        let exp_steps = (24 - exp_offset) / exp_stepsize;
         let searches = 1 << 9;
 
         let mut group = c.benchmark_group("batch_search");
         group.sample_size(30);
-        group.warm_up_time(core::time::Duration::from_millis(500));
-        group.measurement_time(core::time::Duration::from_secs(3));
+        group.warm_up_time(core::time::Duration::from_millis(1000));
+        group.measurement_time(core::time::Duration::from_secs(10));
         //group.plot_config(PlotConfiguration::default().summary_scale(AxisScale::Logarithmic));
         for step in 0..exp_steps + 1 {
             let exp = exp_offset + exp_stepsize * step;
