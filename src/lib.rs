@@ -400,6 +400,89 @@ pub mod generator {
     }
 }
 
+//optimized version of the generator
+//optimized in the sense that it has fewer variables in scope on the yield point.
+pub mod generator_optimized {
+    use {
+        super::{array, prefetch_read_data},
+        core::ops::{Generator, GeneratorState},
+        core::{
+            cmp::Ordering::{Equal, Greater, Less},
+            pin::Pin,
+        },
+    };
+
+    pub fn batch_search<T: Ord, const B: usize>(
+        slice: &[T],
+        values: &[T],
+        results: &mut [Result<usize, usize>],
+    ) {
+        assert!(results.len() == values.len());
+
+        let get_generator = |i: usize| {
+            let val: &T = &values[i];
+            let mut slice = slice;
+            move || {
+                if slice.len() == 0 {
+                    return Err(0);
+                }
+                let mut offset = 0;
+                while slice.len() > 1 {
+                    // this would also be the place to prefetch s[mid]
+                    prefetch_read_data(unsafe { slice.get_unchecked(slice.len() / 2) });
+                    yield;
+
+                    let cmp = unsafe { slice.get_unchecked(slice.len() / 2) }.cmp(val);
+                    if cmp == Greater {
+                        slice = &slice[..slice.len() / 2];
+                    } else {
+                        offset += slice.len() / 2;
+                        slice = &slice[slice.len() / 2..];
+                    };
+                }
+                // base is always in [0, size) because base <= mid.
+                let cmp = unsafe { slice.get_unchecked(0) }.cmp(val);
+                if cmp == Equal {
+                    Ok(offset)
+                } else {
+                    Err(offset + (cmp == Less) as usize)
+                }
+            }
+        };
+
+        let mut generators: [_; B] = array(|i| Some((i, get_generator(i))));
+        //println!("generator_optimized state size: {}", super::size_of(&generators[0]));
+        let mut next = B;
+        let mut breaks = 0;
+        loop {
+            for i in 0..B {
+                let current = &mut generators[i];
+                if current.is_none() {
+                    continue;
+                }
+                let (j, generator) = current.as_mut().unwrap();
+                match Pin::new(generator).resume(()) {
+                    GeneratorState::Yielded(()) => {}
+                    GeneratorState::Complete(result) => {
+                        results[*j] = result;
+                        if next == values.len() {
+                            breaks += 1;
+                            *current = None;
+                            if breaks == B {
+                                return;
+                            } else {
+                                continue;
+                            }
+                        }
+                        *current = Some((next, get_generator(next)));
+                        next += 1;
+                    }
+                }
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -436,14 +519,16 @@ mod tests {
         let n = 1 << 8;
         let m = 1 << 4;
         let (slice, values) = create_data_u32(n, m);
-        let functions: [fn(&[u32], &[u32], &mut [Result<usize, usize>]); 5] = [
+        let functions: [fn(&[u32], &[u32], &mut [Result<usize, usize>]); 6] = [
             default::batch_search,
             naive::batch_search,
             concurrent::batch_search::<_, 4>,
             handcrafted::batch_search::<_, 4>,
             generator::batch_search::<_, 4>,
+            generator_optimized::batch_search::<_, 4>,
         ];
         let mut results = [
+            Vec::default(),
             Vec::default(),
             Vec::default(),
             Vec::default(),
@@ -534,6 +619,26 @@ mod tests {
                 )*}
             }
             bench_generator!(4, 8, 12, 16);
+
+            macro_rules! bench_generator_optimized {
+                ($($batch:literal),*) => {$(
+                    let name = format!("generator_optimized_{:02}", $batch);
+                    group.bench_with_input(
+                        BenchmarkId::new(name, &parameter_string),
+                        &size,
+                        |b, n| {
+                            b.iter(|| {
+                                generator_optimized::batch_search::<_, $batch>(
+                                    &slice[0..*n],
+                                    &values,
+                                    &mut results,
+                                )
+                            })
+                        },
+                    );
+                )*}
+            }
+            bench_generator_optimized!(4, 8, 12, 16);
 
             macro_rules! bench_concurrent {
                 ($($batch:literal),*) => {$(
